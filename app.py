@@ -35,7 +35,7 @@ def handle_http_exception(error):
 def health_check():
     return json_response(
         "success",
-        "伺服器運作正常",
+        "伺服器運作正常，測試正常可以進行其他任務。",
         {
             "status": "running",
             "timestamp": datetime.now(timezone.utc).isoformat(),

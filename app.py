@@ -19,6 +19,7 @@ from routes import (
     draw_periods_bp,
     instruments_bp,
     trades_bp,
+    summary_bp,
 )
 from utils import json_response
 
@@ -51,6 +52,7 @@ def create_app():
     app.register_blueprint(draw_periods_bp)
     app.register_blueprint(instruments_bp)
     app.register_blueprint(trades_bp)
+    app.register_blueprint(summary_bp)
 
     @app.errorhandler(HTTPException)
     def handle_http_exception(error):

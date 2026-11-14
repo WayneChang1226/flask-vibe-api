@@ -57,6 +57,7 @@ invoices_bp = Blueprint("invoices", __name__, url_prefix="/api/invoices")
 draw_periods_bp = Blueprint("draw_periods", __name__, url_prefix="/api/draw-periods")
 instruments_bp = Blueprint("instruments", __name__, url_prefix="/api/instruments")
 trades_bp = Blueprint("trades", __name__, url_prefix="/api/trades")
+summary_bp = Blueprint("summary", __name__, url_prefix="/api/summary")
 
 
 # ==========================================
@@ -2201,5 +2202,61 @@ def void_trade(trade_id: int):
     except Exception:
         db.session.rollback()
         return json_response(500, "伺服器內部錯誤")
+
+
+# ==========================================
+# 月度生活現金流彙總路由 Summary Routes
+# ==========================================
+
+@summary_bp.route("", methods=["GET"], strict_slashes=False)
+def get_monthly_summary():
+    month_val = request.args.get("month")
+    if not month_val or not str(month_val).strip():
+        return json_response(400, "查詢月份為必填項目，格式為 YYYY-MM")
+
+    month_str = str(month_val).strip()
+    if not re.match(r"^\d{4}-(0[1-9]|1[0-2])$", month_str):
+        return json_response(400, "月份格式不正確，必須為 YYYY-MM 格式（如 2026-11）")
+
+    try:
+        year, month = map(int, month_str.split("-"))
+        start_date = date(year, month, 1)
+        _, last_day = calendar.monthrange(year, month)
+        end_date = date(year, month, last_day)
+    except Exception:
+        return json_response(400, "月份日期無效")
+
+    # 1. 入帳合計：received_on 落在該月的入帳，金額乘 fx_rate_to_twd 後加總
+    incomes = (
+        Income.query.filter(
+            Income.received_on >= start_date,
+            Income.received_on <= end_date,
+        ).all()
+    )
+    income_twd = sum(
+        (Decimal(str(i.amount)) * Decimal(str(i.fx_rate_to_twd)) for i in incomes),
+        Decimal("0"),
+    )
+
+    # 2. 花費合計：spent_on 落在該月的花費，金額乘 fx_rate_to_twd 後加總
+    expenses = (
+        Expense.query.filter(
+            Expense.spent_on >= start_date,
+            Expense.spent_on <= end_date,
+        ).all()
+    )
+    expense_twd = sum(
+        (Decimal(str(e.amount)) * Decimal(str(e.fx_rate_to_twd)) for e in expenses),
+        Decimal("0"),
+    )
+
+    data = {
+        "month": month_str,
+        "income_twd": float(income_twd),
+        "expense_twd": float(expense_twd),
+    }
+
+    return json_response(200, "取得月度現金流彙總成功", data)
+
 
 

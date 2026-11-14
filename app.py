@@ -15,6 +15,8 @@ from routes import (
     incomes_bp,
     expense_categories_bp,
     expenses_bp,
+    invoices_bp,
+    draw_periods_bp,
 )
 from utils import json_response
 
@@ -43,6 +45,8 @@ def create_app():
     app.register_blueprint(incomes_bp)
     app.register_blueprint(expense_categories_bp)
     app.register_blueprint(expenses_bp)
+    app.register_blueprint(invoices_bp)
+    app.register_blueprint(draw_periods_bp)
 
     @app.errorhandler(HTTPException)
     def handle_http_exception(error):

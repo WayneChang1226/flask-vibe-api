@@ -1,4 +1,6 @@
-from datetime import datetime, timezone
+import calendar
+import re
+from datetime import date, datetime, timezone
 from decimal import Decimal, InvalidOperation
 
 from flask import Blueprint, request
@@ -11,18 +13,35 @@ from models import (
     IncomeCategory,
     Income,
     Invoice,
+    InvoiceItem,
+    DrawPeriod,
+    DrawPrize,
     ExpenseCategory,
     Expense,
 )
 from utils import json_response
 
 ALLOWED_ACCOUNT_KINDS = {"cash", "bank", "credit_card", "broker"}
+ALLOWED_DRAW_TIERS = {
+    "special",
+    "grand",
+    "first",
+    "second",
+    "third",
+    "fourth",
+    "fifth",
+    "sixth",
+    "extra_sixth",
+}
 
 accounts_bp = Blueprint("accounts", __name__, url_prefix="/api/accounts")
 transfers_bp = Blueprint("transfers", __name__, url_prefix="/api/transfers")
 income_categories_bp = Blueprint("income_categories", __name__, url_prefix="/api/income-categories")
 incomes_bp = Blueprint("incomes", __name__, url_prefix="/api/incomes")
 expense_categories_bp = Blueprint("expense_categories", __name__, url_prefix="/api/expense-categories")
+expenses_bp = Blueprint("expenses", __name__, url_prefix="/api/expenses")
+invoices_bp = Blueprint("invoices", __name__, url_prefix="/api/invoices")
+draw_periods_bp = Blueprint("draw_periods", __name__, url_prefix="/api/draw-periods")
 expenses_bp = Blueprint("expenses", __name__, url_prefix="/api/expenses")
 
 
@@ -1139,3 +1158,567 @@ def update_expense(expense_id: int):
     except Exception:
         db.session.rollback()
         return json_response(500, "伺服器內部錯誤")
+
+
+# ==========================================
+# 發票與開獎輔助函式 Helper Functions
+# ==========================================
+
+def get_period_key(d: date) -> str:
+    period_month = ((d.month - 1) // 2) * 2 + 1
+    return f"{d.year}-{period_month:02d}"
+
+
+def get_period_date_range(period_key: str):
+    cleaned = period_key.strip()
+    if "-" in cleaned:
+        parts = cleaned.split("-")
+        year = int(parts[0])
+        start_month = int(parts[1])
+    else:
+        year = int(cleaned[:4])
+        start_month = int(cleaned[4:])
+    start_date = date(year, start_month, 1)
+    end_month = start_month + 1
+    _, last_day = calendar.monthrange(year, end_month)
+    end_date = date(year, end_month, last_day)
+    return start_date, end_date
+
+
+def is_matched_prize(inv_num: str, prize) -> bool:
+    tier = prize.tier
+    m_num = str(prize.matching_number).strip()
+    if tier in ("special", "grand", "first"):
+        return inv_num == m_num
+    elif tier == "second":
+        if len(m_num) == 8:
+            return inv_num[-7:] == m_num[-7:]
+        return inv_num.endswith(m_num)
+    elif tier == "third":
+        if len(m_num) == 8:
+            return inv_num[-6:] == m_num[-6:]
+        return inv_num.endswith(m_num)
+    elif tier == "fourth":
+        if len(m_num) == 8:
+            return inv_num[-5:] == m_num[-5:]
+        return inv_num.endswith(m_num)
+    elif tier == "fifth":
+        if len(m_num) == 8:
+            return inv_num[-4:] == m_num[-4:]
+        return inv_num.endswith(m_num)
+    elif tier in ("sixth", "extra_sixth"):
+        if len(m_num) == 8:
+            return inv_num[-3:] == m_num[-3:]
+        return inv_num.endswith(m_num)
+    return False
+
+
+# ==========================================
+# 發票路由 Invoices Routes
+# ==========================================
+
+@invoices_bp.route("", methods=["GET"], strict_slashes=False)
+def list_invoices():
+    query = Invoice.query
+
+    if "period_key" in request.args:
+        period_key_val = request.args.get("period_key", "").strip()
+        if period_key_val != "":
+            try:
+                start_date, end_date = get_period_date_range(period_key_val)
+                query = query.filter(Invoice.issued_on >= start_date, Invoice.issued_on <= end_date)
+            except (ValueError, IndexError):
+                return json_response(400, "開獎期別格式不正確，例如 2026-01")
+
+    if "prize_status" in request.args:
+        status_val = request.args.get("prize_status", "").strip()
+        if status_val != "":
+            query = query.filter(Invoice.prize_status == status_val)
+
+    invoices = query.order_by(Invoice.issued_on.desc(), Invoice.id.desc()).all()
+    return json_response(200, "取得發票清單成功", [inv.to_dict() for inv in invoices])
+
+
+@invoices_bp.route("", methods=["POST"], strict_slashes=False)
+def create_invoice():
+    body = request.get_json(silent=True)
+    if body is None or not isinstance(body, dict):
+        return json_response(400, "請求內容必須是有效的 JSON 格式")
+
+    number_val = body.get("number")
+    if number_val is None or str(number_val).strip() == "":
+        return json_response(400, "發票號碼為必填項目")
+    number = str(number_val).strip().upper()
+    if not re.match(r"^[A-Z]{2}[0-9]{8}$", number):
+        return json_response(400, "發票號碼格式不符，必須為 2 碼大寫英文加 8 碼數字")
+
+    existing = Invoice.query.filter_by(number=number).first()
+    if existing:
+        return json_response(400, "發票號碼已被使用，請勿重複新增")
+
+    issued_on_val = body.get("issued_on")
+    if issued_on_val is None or str(issued_on_val).strip() == "":
+        return json_response(400, "開立日為必填項目")
+    try:
+        issued_on = datetime.strptime(str(issued_on_val).strip(), "%Y-%m-%d").date()
+    except ValueError:
+        return json_response(400, "開立日格式不正確，請使用 YYYY-MM-DD 格式")
+
+    amount_val = body.get("amount")
+    if amount_val is None:
+        return json_response(400, "金額為必填項目")
+    try:
+        amount = Decimal(str(amount_val))
+        if amount <= 0:
+            return json_response(400, "金額必須大於 0")
+    except (InvalidOperation, TypeError, ValueError):
+        return json_response(400, "金額格式不正確，必須為正數")
+
+    kind_val = body.get("kind")
+    if kind_val is None or str(kind_val).strip() == "":
+        return json_response(400, "發票種類為必填項目")
+    kind = str(kind_val).strip()
+    if kind not in ("paper", "electronic"):
+        return json_response(400, "發票種類不合法，只允許 paper、electronic")
+
+    currency_val = body.get("currency")
+    if currency_val is None or str(currency_val).strip() == "":
+        currency = "TWD"
+    else:
+        currency = str(currency_val).strip().upper()
+        if len(currency) != 3 or not currency.isalpha():
+            return json_response(400, "幣別代碼必須為 3 碼英文字母")
+
+    fx_rate_val = body.get("fx_rate_to_twd")
+    if fx_rate_val is None or str(fx_rate_val).strip() == "":
+        if currency == "TWD":
+            fx_rate_to_twd = Decimal("1.0")
+        else:
+            return json_response(400, "外幣發票必須填寫匯率")
+    else:
+        try:
+            fx_rate_to_twd = Decimal(str(fx_rate_val))
+            if fx_rate_to_twd <= 0:
+                return json_response(400, "匯率必須大於 0")
+        except (InvalidOperation, TypeError, ValueError):
+            return json_response(400, "匯率格式不正確，必須為正數")
+
+    random_code = None
+    if "random_code" in body and body["random_code"] is not None and str(body["random_code"]).strip() != "":
+        code_str = str(body["random_code"]).strip()
+        if not re.match(r"^[0-9]{4}$", code_str):
+            return json_response(400, "隨機碼必須為 4 碼數字")
+        random_code = code_str
+
+    seller_name = None
+    if "seller_name" in body and body["seller_name"] is not None and str(body["seller_name"]).strip() != "":
+        seller_name = str(body["seller_name"]).strip()
+
+    seller_ban = None
+    if "seller_ban" in body and body["seller_ban"] is not None and str(body["seller_ban"]).strip() != "":
+        ban_str = str(body["seller_ban"]).strip()
+        if not re.match(r"^[0-9]{8}$", ban_str):
+            return json_response(400, "賣方統一編號必須為 8 碼數字")
+        seller_ban = ban_str
+
+    try:
+        invoice = Invoice(
+            number=number,
+            issued_on=issued_on,
+            amount=amount,
+            kind=kind,
+            currency=currency,
+            fx_rate_to_twd=fx_rate_to_twd,
+            random_code=random_code,
+            seller_name=seller_name,
+            seller_ban=seller_ban,
+        )
+        db.session.add(invoice)
+        db.session.commit()
+        return json_response(201, "發票建立成功", invoice.to_dict())
+    except IntegrityError:
+        db.session.rollback()
+        return json_response(400, "資料格式不合法或違反約束條件")
+    except OperationalError:
+        db.session.rollback()
+        return json_response(500, "資料庫連線失敗，請稍後再試")
+    except Exception:
+        db.session.rollback()
+        return json_response(500, "伺服器內部錯誤")
+
+
+@invoices_bp.route("/<int:invoice_id>", methods=["GET"], strict_slashes=False)
+def get_invoice(invoice_id: int):
+    invoice = db.session.get(Invoice, invoice_id)
+    if not invoice:
+        return json_response(404, "找不到指定的發票")
+
+    data = invoice.to_dict()
+    data["items"] = [item.to_dict() for item in invoice.items]
+    data["expense_ids"] = [e.id for e in invoice.expenses]
+    return json_response(200, "取得發票成功", data)
+
+
+@invoices_bp.route("/<int:invoice_id>", methods=["PATCH"], strict_slashes=False)
+def update_invoice(invoice_id: int):
+    invoice = db.session.get(Invoice, invoice_id)
+    if not invoice:
+        return json_response(404, "找不到指定的發票")
+
+    body = request.get_json(silent=True)
+    if body is None or not isinstance(body, dict):
+        return json_response(400, "請求內容必須是有效的 JSON 格式")
+
+    if "seller_name" in body:
+        val = body.get("seller_name")
+        invoice.seller_name = str(val).strip() if val is not None and str(val).strip() != "" else None
+
+    if "seller_ban" in body:
+        val = body.get("seller_ban")
+        if val is None or str(val).strip() == "":
+            invoice.seller_ban = None
+        else:
+            ban_str = str(val).strip()
+            if not re.match(r"^[0-9]{8}$", ban_str):
+                return json_response(400, "賣方統一編號必須為 8 碼數字")
+            invoice.seller_ban = ban_str
+
+    if "random_code" in body:
+        val = body.get("random_code")
+        if val is None or str(val).strip() == "":
+            invoice.random_code = None
+        else:
+            code_str = str(val).strip()
+            if not re.match(r"^[0-9]{4}$", code_str):
+                return json_response(400, "隨機碼必須為 4 碼數字")
+            invoice.random_code = code_str
+
+    if "prize_status" in body:
+        status_val = str(body.get("prize_status", "")).strip()
+        if status_val == "void":
+            invoice.prize_status = "void"
+        elif status_val in ("unchecked", "lost", "won", "claimed", "void"):
+            invoice.prize_status = status_val
+        else:
+            return json_response(400, "發票狀態不合法")
+
+    invoice.updated_at = datetime.now(timezone.utc)
+
+    try:
+        db.session.commit()
+        return json_response(200, "發票更新成功", invoice.to_dict())
+    except IntegrityError:
+        db.session.rollback()
+        return json_response(400, "資料格式不合法或違反約束條件")
+    except OperationalError:
+        db.session.rollback()
+        return json_response(500, "資料庫連線失敗，請稍後再試")
+    except Exception:
+        db.session.rollback()
+        return json_response(500, "伺服器內部錯誤")
+
+
+@invoices_bp.route("/<int:invoice_id>/items", methods=["GET"], strict_slashes=False)
+def list_invoice_items(invoice_id: int):
+    invoice = db.session.get(Invoice, invoice_id)
+    if not invoice:
+        return json_response(404, "找不到指定的發票")
+    return json_response(200, "取得發票品項清單成功", [item.to_dict() for item in invoice.items])
+
+
+@invoices_bp.route("/<int:invoice_id>/items", methods=["POST"], strict_slashes=False)
+def create_invoice_item(invoice_id: int):
+    invoice = db.session.get(Invoice, invoice_id)
+    if not invoice:
+        return json_response(404, "找不到指定的發票")
+
+    body = request.get_json(silent=True)
+    if body is None or not isinstance(body, dict):
+        return json_response(400, "請求內容必須是有效的 JSON 格式")
+
+    name_val = body.get("name")
+    if name_val is None or str(name_val).strip() == "":
+        return json_response(400, "品項名稱為必填項目")
+    name = str(name_val).strip()
+
+    quantity_val = body.get("quantity")
+    if quantity_val is None:
+        return json_response(400, "數量為必填項目")
+    try:
+        quantity = Decimal(str(quantity_val))
+        if quantity <= 0:
+            return json_response(400, "數量必須大於 0")
+    except (InvalidOperation, TypeError, ValueError):
+        return json_response(400, "數量格式不正確，必須為正數")
+
+    unit_price_val = body.get("unit_price")
+    if unit_price_val is None:
+        return json_response(400, "單價為必填項目")
+    try:
+        unit_price = Decimal(str(unit_price_val))
+        if unit_price <= 0:
+            return json_response(400, "單價必須大於 0")
+    except (InvalidOperation, TypeError, ValueError):
+        return json_response(400, "單價格式不正確，必須為正數")
+
+    line_amount_val = body.get("line_amount")
+    if line_amount_val is None:
+        return json_response(400, "小計為必填項目")
+    try:
+        line_amount = Decimal(str(line_amount_val))
+        if line_amount <= 0:
+            return json_response(400, "小計必須大於 0")
+    except (InvalidOperation, TypeError, ValueError):
+        return json_response(400, "小計格式不正確，必須為正數")
+
+    try:
+        item = InvoiceItem(
+            invoice_id=invoice.id,
+            name=name,
+            quantity=quantity,
+            unit_price=unit_price,
+            line_amount=line_amount,
+        )
+        db.session.add(item)
+        db.session.commit()
+        return json_response(201, "品項建立成功", item.to_dict())
+    except IntegrityError:
+        db.session.rollback()
+        return json_response(400, "資料格式不合法或違反約束條件")
+    except OperationalError:
+        db.session.rollback()
+        return json_response(500, "資料庫連線失敗，請稍後再試")
+    except Exception:
+        db.session.rollback()
+        return json_response(500, "伺服器內部錯誤")
+
+
+@invoices_bp.route("/<int:invoice_id>/prize-income", methods=["POST"], strict_slashes=False)
+def claim_prize_income(invoice_id: int):
+    invoice = db.session.get(Invoice, invoice_id)
+    if not invoice:
+        return json_response(404, "找不到指定的發票")
+
+    existing_income = Income.query.filter_by(invoice_id=invoice.id).first()
+    if existing_income:
+        return json_response(400, "此發票已領取過獎金，不可重複領取")
+
+    if invoice.prize_status != "won":
+        return json_response(400, "發票狀態非中獎狀態，無法執行領獎入帳")
+
+    body = request.get_json(silent=True)
+    if body is None or not isinstance(body, dict):
+        return json_response(400, "請求內容必須是有效的 JSON 格式")
+
+    cat_id_val = body.get("category_id")
+    if cat_id_val is None:
+        return json_response(400, "入帳分類為必填項目")
+    try:
+        category_id = int(cat_id_val)
+    except (TypeError, ValueError):
+        return json_response(400, "分類 ID 必須為整數")
+
+    category = db.session.get(IncomeCategory, category_id)
+    if not category:
+        return json_response(400, "指定的入帳分類不存在")
+
+    acc_id_val = body.get("account_id")
+    if acc_id_val is None:
+        return json_response(400, "帳戶為必填項目")
+    try:
+        account_id = int(acc_id_val)
+    except (TypeError, ValueError):
+        return json_response(400, "帳戶 ID 必須為整數")
+
+    account = db.session.get(Account, account_id)
+    if not account:
+        return json_response(400, "指定的帳戶不存在")
+
+    # 查出該期中獎獎金
+    period_key = get_period_key(invoice.issued_on)
+    draw_period = DrawPeriod.query.filter_by(period_key=period_key).first()
+    if not draw_period or not draw_period.prizes:
+        return json_response(400, "找不到該期對應的中獎獎項資料")
+
+    inv_num = invoice.number[2:]
+    matched = [p for p in draw_period.prizes if is_matched_prize(inv_num, p)]
+    if not matched:
+        return json_response(400, "發票號碼未對中該期任何獎項")
+
+    best_prize = max(matched, key=lambda p: p.amount)
+    prize_amount = best_prize.amount
+
+    try:
+        income = Income(
+            received_on=datetime.now(timezone.utc).date(),
+            amount=prize_amount,
+            currency=invoice.currency,
+            fx_rate_to_twd=invoice.fx_rate_to_twd,
+            category_id=category.id,
+            account_id=account.id,
+            source=f"統一發票中獎-{best_prize.tier}",
+            note=f"發票號碼：{invoice.number}",
+            invoice_id=invoice.id,
+        )
+        db.session.add(income)
+        invoice.prize_status = "claimed"
+        invoice.updated_at = datetime.now(timezone.utc)
+        db.session.commit()
+        return json_response(201, "中獎入帳建立成功", income.to_dict())
+    except Exception:
+        db.session.rollback()
+        return json_response(500, "處理中獎入帳失敗，交易已復原")
+
+
+# ==========================================
+# 開獎期別路由 Draw Periods Routes
+# ==========================================
+
+@draw_periods_bp.route("", methods=["POST"], strict_slashes=False)
+def create_draw_period():
+    body = request.get_json(silent=True)
+    if body is None or not isinstance(body, dict):
+        return json_response(400, "請求內容必須是有效的 JSON 格式")
+
+    period_key_val = body.get("period_key")
+    if period_key_val is None or str(period_key_val).strip() == "":
+        return json_response(400, "開獎期別為必填項目")
+    period_key = str(period_key_val).strip()
+
+    existing = DrawPeriod.query.filter_by(period_key=period_key).first()
+    if existing:
+        return json_response(400, "開獎期別已被使用，請勿重複建立")
+
+    try:
+        dp = DrawPeriod(period_key=period_key)
+        db.session.add(dp)
+        db.session.commit()
+        return json_response(201, "開獎期別建立成功", dp.to_dict())
+    except IntegrityError:
+        db.session.rollback()
+        return json_response(400, "資料格式不合法或違反約束條件")
+    except OperationalError:
+        db.session.rollback()
+        return json_response(500, "資料庫連線失敗，請稍後再試")
+    except Exception:
+        db.session.rollback()
+        return json_response(500, "伺服器內部錯誤")
+
+
+@draw_periods_bp.route("/<int:period_id>/prizes", methods=["POST"], strict_slashes=False)
+def create_draw_prize(period_id: int):
+    dp = db.session.get(DrawPeriod, period_id)
+    if not dp:
+        return json_response(400, "指定的開獎期不存在")
+
+    body = request.get_json(silent=True)
+    if body is None or not isinstance(body, dict):
+        return json_response(400, "請求內容必須是有效的 JSON 格式")
+
+    tier_val = body.get("tier")
+    if tier_val is None or str(tier_val).strip() == "":
+        return json_response(400, "獎項等級為必填項目")
+    tier = str(tier_val).strip().lower()
+    if tier not in ALLOWED_DRAW_TIERS:
+        return json_response(400, "獎項等級不合法")
+
+    matching_number_val = body.get("matching_number")
+    if matching_number_val is None or str(matching_number_val).strip() == "":
+        return json_response(400, "中獎號碼為必填項目")
+    matching_number = str(matching_number_val).strip()
+
+    if tier in ("special", "grand", "first"):
+        if len(matching_number) != 8 or not matching_number.isdigit():
+            return json_response(400, "特別獎、特獎、頭獎的中獎號碼必須為 8 碼數字")
+
+    amount_val = body.get("amount")
+    if amount_val is None:
+        return json_response(400, "獎金金額為必填項目")
+    try:
+        amount = Decimal(str(amount_val))
+        if amount < 0:
+            return json_response(400, "獎金金額不可小於 0")
+    except (InvalidOperation, TypeError, ValueError):
+        return json_response(400, "獎金金額格式不正確")
+
+    existing = DrawPrize.query.filter_by(
+        draw_period_id=dp.id,
+        tier=tier,
+        matching_number=matching_number,
+    ).first()
+    if existing:
+        return json_response(400, "該期已有相同的獎項與中獎號碼")
+
+    try:
+        prize = DrawPrize(
+            draw_period_id=dp.id,
+            tier=tier,
+            matching_number=matching_number,
+            amount=amount,
+        )
+        db.session.add(prize)
+        db.session.commit()
+        return json_response(201, "獎號與獎金建立成功", prize.to_dict())
+    except IntegrityError:
+        db.session.rollback()
+        return json_response(400, "資料格式不合法或違反約束條件")
+    except OperationalError:
+        db.session.rollback()
+        return json_response(500, "資料庫連線失敗，請稍後再試")
+    except Exception:
+        db.session.rollback()
+        return json_response(500, "伺服器內部錯誤")
+
+
+@draw_periods_bp.route("/<int:period_id>/check", methods=["POST"], strict_slashes=False)
+def check_draw_period_prizes(period_id: int):
+    dp = db.session.get(DrawPeriod, period_id)
+    if not dp:
+        return json_response(400, "指定的開獎期不存在")
+
+    try:
+        start_date, end_date = get_period_date_range(dp.period_key)
+    except (ValueError, IndexError):
+        return json_response(400, "開獎期別格式不正確，無法計算日期區間")
+
+    prizes = dp.prizes
+
+    invoices = Invoice.query.filter(
+        Invoice.prize_status != "void",
+        Invoice.issued_on >= start_date,
+        Invoice.issued_on <= end_date,
+    ).all()
+
+    checked_count = 0
+    won_count = 0
+
+    for inv in invoices:
+        checked_count += 1
+        inv_num = inv.number[2:]
+        matched = [p for p in prizes if is_matched_prize(inv_num, p)]
+        if matched:
+            won_count += 1
+            if inv.prize_status != "claimed":
+                inv.prize_status = "won"
+        else:
+            if inv.prize_status != "claimed":
+                inv.prize_status = "lost"
+        inv.updated_at = datetime.now(timezone.utc)
+
+    try:
+        db.session.commit()
+        return json_response(
+            200,
+            "對獎完成",
+            {
+                "checked_count": checked_count,
+                "won_count": won_count,
+            },
+        )
+    except OperationalError:
+        db.session.rollback()
+        return json_response(500, "資料庫連線失敗，請稍後再試")
+    except Exception:
+        db.session.rollback()
+        return json_response(500, "伺服器內部錯誤")
+

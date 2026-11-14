@@ -18,6 +18,8 @@ from models import (
     DrawPrize,
     ExpenseCategory,
     Expense,
+    Instrument,
+    Trade,
 )
 from utils import json_response
 
@@ -33,6 +35,17 @@ ALLOWED_DRAW_TIERS = {
     "sixth",
     "extra_sixth",
 }
+ALLOWED_INSTRUMENT_MARKETS = {"tw_stock", "us_stock", "fund", "other"}
+ALLOWED_TRADE_TYPES = {
+    "buy",
+    "sell",
+    "cash_dividend",
+    "stock_dividend",
+    "drip",
+    "split",
+    "merge",
+    "capital_reduction",
+}
 
 accounts_bp = Blueprint("accounts", __name__, url_prefix="/api/accounts")
 transfers_bp = Blueprint("transfers", __name__, url_prefix="/api/transfers")
@@ -42,7 +55,8 @@ expense_categories_bp = Blueprint("expense_categories", __name__, url_prefix="/a
 expenses_bp = Blueprint("expenses", __name__, url_prefix="/api/expenses")
 invoices_bp = Blueprint("invoices", __name__, url_prefix="/api/invoices")
 draw_periods_bp = Blueprint("draw_periods", __name__, url_prefix="/api/draw-periods")
-expenses_bp = Blueprint("expenses", __name__, url_prefix="/api/expenses")
+instruments_bp = Blueprint("instruments", __name__, url_prefix="/api/instruments")
+trades_bp = Blueprint("trades", __name__, url_prefix="/api/trades")
 
 
 # ==========================================
@@ -244,7 +258,40 @@ def get_account_balance(account_id: int):
         (Decimal(str(e.amount)) * Decimal(str(e.fx_rate_to_twd)) for e in expenses),
         Decimal("0"),
     )
-    twd_balance = opening + twd_in - twd_out + twd_income - twd_expense
+
+    # 投資交易款項結算（排除已作廢交易）
+    trades = Trade.query.filter(
+        Trade.account_id == account.id,
+        Trade.voided_at.is_(None),
+    ).all()
+
+    trade_orig = Decimal("0")
+    trade_twd = Decimal("0")
+
+    for t in trades:
+        qty = Decimal(str(t.quantity or 0))
+        price = Decimal(str(t.price or 0))
+        fee = Decimal(str(t.fee or 0))
+        tax = Decimal(str(t.tax or 0))
+        fx = Decimal(str(t.fx_rate_to_twd or 1))
+        cash = Decimal(str(t.cash_amount or 0))
+
+        if t.trade_type == "buy":
+            cost = (qty * price) + fee + tax
+            trade_orig -= cost
+            trade_twd -= cost * fx
+        elif t.trade_type == "sell":
+            proceeds = (qty * price) - fee - tax
+            trade_orig += proceeds
+            trade_twd += proceeds * fx
+        elif t.trade_type in ("cash_dividend", "capital_reduction"):
+            # 若此交易已在 incomes 表建立對應入帳，則 incomes 已計算，避免重複加計
+            if not t.income:
+                trade_orig += cash
+                trade_twd += cash * fx
+
+    original_balance = opening + orig_in - orig_out + orig_income - orig_expense + trade_orig
+    twd_balance = opening + twd_in - twd_out + twd_income - twd_expense + trade_twd
 
     data = {
         "account_id": account.id,
@@ -1721,4 +1768,438 @@ def check_draw_period_prizes(period_id: int):
     except Exception:
         db.session.rollback()
         return json_response(500, "伺服器內部錯誤")
+
+
+# ==========================================
+# 投資持有股數與成本試算 Helper
+# ==========================================
+
+def calculate_holding(instrument_id: int):
+    trades = (
+        Trade.query.filter(
+            Trade.instrument_id == instrument_id,
+            Trade.voided_at.is_(None),
+        )
+        .order_by(Trade.traded_on.asc(), Trade.id.asc())
+        .all()
+    )
+
+    shares = Decimal("0")
+    total_cost = Decimal("0")
+
+    for t in trades:
+        ttype = t.trade_type
+        qty = Decimal(str(t.quantity or 0))
+        price = Decimal(str(t.price or 0))
+        ratio = Decimal(str(t.ratio or 1))
+
+        if ttype in ("buy", "drip"):
+            shares += qty
+            total_cost += qty * price
+        elif ttype == "sell":
+            if shares > 0:
+                avg_cost = total_cost / shares
+                total_cost -= qty * avg_cost
+                shares -= qty
+                if shares <= 0:
+                    shares = Decimal("0")
+                    total_cost = Decimal("0")
+            else:
+                shares -= qty
+        elif ttype == "stock_dividend":
+            shares += qty
+        elif ttype in ("split", "merge"):
+            if ratio > 0:
+                shares = shares * ratio
+        elif ttype == "capital_reduction":
+            if t.quantity is not None and Decimal(str(t.quantity)) > 0:
+                red_qty = Decimal(str(t.quantity))
+                if shares > 0:
+                    avg_cost = total_cost / shares
+                    total_cost -= red_qty * avg_cost
+                    shares -= red_qty
+                    if shares <= 0:
+                        shares = Decimal("0")
+                        total_cost = Decimal("0")
+                else:
+                    shares -= red_qty
+            elif t.ratio is not None and Decimal(str(t.ratio)) > 0:
+                shares = shares * Decimal(str(t.ratio))
+
+    avg_cost = (total_cost / shares) if shares > 0 else Decimal("0")
+    return shares, avg_cost
+
+
+# ==========================================
+# 投資標的路由 Instruments Routes
+# ==========================================
+
+@instruments_bp.route("", methods=["GET"], strict_slashes=False)
+def list_instruments():
+    instruments = Instrument.query.order_by(Instrument.id.asc()).all()
+    return json_response(200, "取得標的清單成功", [inst.to_dict() for inst in instruments])
+
+
+@instruments_bp.route("", methods=["POST"], strict_slashes=False)
+def create_instrument():
+    body = request.get_json(silent=True)
+    if body is None or not isinstance(body, dict):
+        return json_response(400, "請求內容必須是有效的 JSON 格式")
+
+    market_val = body.get("market")
+    if market_val is None or str(market_val).strip() == "":
+        return json_response(400, "交易市場為必填項目")
+    market = str(market_val).strip().lower()
+    if market not in ALLOWED_INSTRUMENT_MARKETS:
+        return json_response(400, "交易市場種類不合法")
+
+    symbol_val = body.get("symbol")
+    if symbol_val is None or str(symbol_val).strip() == "":
+        return json_response(400, "標的代號為必填項目")
+    symbol = str(symbol_val).strip().upper()
+
+    name_val = body.get("name")
+    if name_val is None or str(name_val).strip() == "":
+        return json_response(400, "標的名稱為必填項目")
+    name = str(name_val).strip()
+
+    currency_val = body.get("currency")
+    if currency_val is None or str(currency_val).strip() == "":
+        return json_response(400, "計價幣別為必填項目")
+    currency = str(currency_val).strip().upper()
+    if len(currency) != 3 or not currency.isalpha():
+        return json_response(400, "幣別代碼必須為 3 碼英文字母")
+
+    existing = Instrument.query.filter_by(market=market, symbol=symbol).first()
+    if existing:
+        return json_response(400, "同一市場已有相同代號的投資標的")
+
+    try:
+        instrument = Instrument(
+            market=market,
+            symbol=symbol,
+            name=name,
+            currency=currency,
+        )
+        db.session.add(instrument)
+        db.session.commit()
+        return json_response(201, "標的建立成功", instrument.to_dict())
+    except IntegrityError:
+        db.session.rollback()
+        return json_response(400, "資料格式不合法或違反約束條件")
+    except OperationalError:
+        db.session.rollback()
+        return json_response(500, "資料庫連線失敗，請稍後再試")
+    except Exception:
+        db.session.rollback()
+        return json_response(500, "伺服器內部錯誤")
+
+
+@instruments_bp.route("/<int:instrument_id>", methods=["GET"], strict_slashes=False)
+def get_instrument(instrument_id: int):
+    instrument = db.session.get(Instrument, instrument_id)
+    if not instrument:
+        return json_response(404, "找不到指定的投資標的")
+    return json_response(200, "取得標的成功", instrument.to_dict())
+
+
+@instruments_bp.route("/<int:instrument_id>/holding", methods=["GET"], strict_slashes=False)
+def get_instrument_holding(instrument_id: int):
+    instrument = db.session.get(Instrument, instrument_id)
+    if not instrument:
+        return json_response(404, "找不到指定的投資標的")
+
+    shares, avg_cost = calculate_holding(instrument.id)
+    return json_response(
+        200,
+        "取得持有狀況成功",
+        {
+            "quantity": float(shares),
+            "average_cost": float(avg_cost),
+            "currency": instrument.currency,
+        },
+    )
+
+
+# ==========================================
+# 投資交易路由 Trades Routes
+# ==========================================
+
+@trades_bp.route("", methods=["GET"], strict_slashes=False)
+def list_trades():
+    query = Trade.query
+
+    if "instrument_id" in request.args:
+        try:
+            inst_id = int(request.args.get("instrument_id"))
+            query = query.filter(Trade.instrument_id == inst_id)
+        except (TypeError, ValueError):
+            return json_response(400, "標的 ID 必須為整數")
+
+    if "account_id" in request.args:
+        try:
+            acc_id = int(request.args.get("account_id"))
+            query = query.filter(Trade.account_id == acc_id)
+        except (TypeError, ValueError):
+            return json_response(400, "帳戶 ID 必須為整數")
+
+    trades = query.order_by(Trade.traded_on.desc(), Trade.id.desc()).all()
+    return json_response(200, "取得交易清單成功", [t.to_dict() for t in trades])
+
+
+@trades_bp.route("", methods=["POST"], strict_slashes=False)
+def create_trade():
+    body = request.get_json(silent=True)
+    if body is None or not isinstance(body, dict):
+        return json_response(400, "請求內容必須是有效的 JSON 格式")
+
+    inst_id_val = body.get("instrument_id")
+    if inst_id_val is None:
+        return json_response(400, "投資標的為必填項目")
+    try:
+        instrument_id = int(inst_id_val)
+    except (TypeError, ValueError):
+        return json_response(400, "投資標的 ID 必須為整數")
+    instrument = db.session.get(Instrument, instrument_id)
+    if not instrument:
+        return json_response(400, "指定的投資標的不存在")
+
+    acc_id_val = body.get("account_id")
+    if acc_id_val is None:
+        return json_response(400, "交割帳戶為必填項目")
+    try:
+        account_id = int(acc_id_val)
+    except (TypeError, ValueError):
+        return json_response(400, "帳戶 ID 必須為整數")
+    account = db.session.get(Account, account_id)
+    if not account:
+        return json_response(400, "指定的帳戶不存在")
+
+    type_val = body.get("trade_type")
+    if type_val is None or str(type_val).strip() == "":
+        return json_response(400, "交易種類為必填項目")
+    trade_type = str(type_val).strip().lower()
+    if trade_type not in ALLOWED_TRADE_TYPES:
+        return json_response(400, "交易種類不允許")
+
+    traded_on_val = body.get("traded_on")
+    if traded_on_val is None or str(traded_on_val).strip() == "":
+        return json_response(400, "交易日期為必填項目")
+    try:
+        traded_on = datetime.strptime(str(traded_on_val).strip(), "%Y-%m-%d").date()
+    except ValueError:
+        return json_response(400, "交易日期格式不正確，請使用 YYYY-MM-DD 格式")
+
+    currency_val = body.get("currency")
+    if currency_val is None or str(currency_val).strip() == "":
+        currency = instrument.currency
+    else:
+        currency = str(currency_val).strip().upper()
+        if len(currency) != 3 or not currency.isalpha():
+            return json_response(400, "幣別代碼必須為 3 碼英文字母")
+
+    fx_rate_val = body.get("fx_rate_to_twd")
+    if fx_rate_val is None or str(fx_rate_val).strip() == "":
+        if currency == "TWD":
+            fx_rate_to_twd = Decimal("1.0")
+        else:
+            return json_response(400, "外幣交易必須提供匯率")
+    else:
+        try:
+            fx_rate_to_twd = Decimal(str(fx_rate_val))
+            if fx_rate_to_twd <= 0:
+                return json_response(400, "匯率必須大於 0")
+        except (InvalidOperation, TypeError, ValueError):
+            return json_response(400, "匯率格式不正確，必須為正數")
+
+    # 依交易種類檢查並提取參數
+    quantity = None
+    if body.get("quantity") is not None and str(body.get("quantity")).strip() != "":
+        try:
+            quantity = Decimal(str(body["quantity"]))
+            if quantity < 0:
+                return json_response(400, "數量不可小於 0")
+        except (InvalidOperation, TypeError, ValueError):
+            return json_response(400, "數量格式不正確")
+
+    price = None
+    if body.get("price") is not None and str(body.get("price")).strip() != "":
+        try:
+            price = Decimal(str(body["price"]))
+            if price < 0:
+                return json_response(400, "價格不可小於 0")
+        except (InvalidOperation, TypeError, ValueError):
+            return json_response(400, "價格格式不正確")
+
+    cash_amount = None
+    if body.get("cash_amount") is not None and str(body.get("cash_amount")).strip() != "":
+        try:
+            cash_amount = Decimal(str(body["cash_amount"]))
+            if cash_amount < 0:
+                return json_response(400, "現金金額不可小於 0")
+        except (InvalidOperation, TypeError, ValueError):
+            return json_response(400, "現金金額格式不正確")
+
+    ratio = None
+    if body.get("ratio") is not None and str(body.get("ratio")).strip() != "":
+        try:
+            ratio = Decimal(str(body["ratio"]))
+            if ratio <= 0:
+                return json_response(400, "比例必須大於 0")
+        except (InvalidOperation, TypeError, ValueError):
+            return json_response(400, "比例格式不正確")
+
+    fee = Decimal("0")
+    if body.get("fee") is not None and str(body.get("fee")).strip() != "":
+        try:
+            fee = Decimal(str(body["fee"]))
+            if fee < 0:
+                return json_response(400, "手續費不可小於 0")
+        except (InvalidOperation, TypeError, ValueError):
+            return json_response(400, "手續費格式不正確")
+
+    tax = Decimal("0")
+    if body.get("tax") is not None and str(body.get("tax")).strip() != "":
+        try:
+            tax = Decimal(str(body["tax"]))
+            if tax < 0:
+                return json_response(400, "交易稅不可小於 0")
+        except (InvalidOperation, TypeError, ValueError):
+            return json_response(400, "交易稅格式不正確")
+
+    # 種類規則校驗
+    if trade_type in ("buy", "drip"):
+        if quantity is None or quantity <= 0:
+            return json_response(400, "買進或股息再投入必須提供大於 0 的數量")
+        if price is None:
+            return json_response(400, "買進或股息再投入必須提供價格")
+    elif trade_type == "sell":
+        if quantity is None or quantity <= 0:
+            return json_response(400, "賣出必須提供大於 0 的數量")
+        if price is None:
+            return json_response(400, "賣出必須提供價格")
+        # 檢查持有是否會小於 0
+        current_holding, _ = calculate_holding(instrument.id)
+        if current_holding - quantity < 0:
+            return json_response(400, "賣出數量超過目前持有股數")
+    elif trade_type == "stock_dividend":
+        if quantity is None or quantity <= 0:
+            return json_response(400, "股票股利必須提供大於 0 的數量")
+    elif trade_type == "cash_dividend":
+        if cash_amount is None or cash_amount <= 0:
+            return json_response(400, "現金股利必須提供大於 0 的現金金額")
+    elif trade_type in ("split", "merge"):
+        if ratio is None or ratio <= 0:
+            return json_response(400, "股票分割或合併必須提供大於 0 的比例")
+    elif trade_type == "capital_reduction":
+        if quantity is None and ratio is None and cash_amount is None:
+            return json_response(400, "減資交易必須提供減資股數、換股比例或退回現金")
+        if quantity is not None and quantity > 0:
+            current_holding, _ = calculate_holding(instrument.id)
+            if current_holding - quantity < 0:
+                return json_response(400, "減資股數超過目前持有股數")
+
+    # 處理 post_income
+    post_income_val = body.get("post_income")
+    is_post_income = post_income_val is True or str(post_income_val).lower() == "true"
+
+    if is_post_income and trade_type in ("cash_dividend", "capital_reduction") and cash_amount and cash_amount > 0:
+        cat_id_val = body.get("income_category_id")
+        if cat_id_val is None:
+            return json_response(400, "設定 post_income 時必須提供 income_category_id")
+        try:
+            income_category_id = int(cat_id_val)
+        except (TypeError, ValueError):
+            return json_response(400, "入帳分類 ID 必須為整數")
+        income_category = db.session.get(IncomeCategory, income_category_id)
+        if not income_category:
+            return json_response(400, "指定的入帳分類不存在")
+
+        try:
+            trade = Trade(
+                instrument_id=instrument.id,
+                account_id=account.id,
+                trade_type=trade_type,
+                traded_on=traded_on,
+                quantity=quantity,
+                price=price,
+                cash_amount=cash_amount,
+                ratio=ratio,
+                fee=fee,
+                tax=tax,
+                currency=currency,
+                fx_rate_to_twd=fx_rate_to_twd,
+            )
+            db.session.add(trade)
+            db.session.flush()
+
+            income = Income(
+                received_on=traded_on,
+                amount=cash_amount,
+                currency=currency,
+                fx_rate_to_twd=fx_rate_to_twd,
+                category_id=income_category.id,
+                account_id=account.id,
+                source=f"投資-{trade_type}",
+                note=f"標的代號：{instrument.symbol}",
+                trade_id=trade.id,
+            )
+            db.session.add(income)
+            db.session.commit()
+            return json_response(201, "交易與入帳建立成功", trade.to_dict())
+        except Exception:
+            db.session.rollback()
+            return json_response(500, "建立交易與入帳失敗，交易已復原")
+
+    try:
+        trade = Trade(
+            instrument_id=instrument.id,
+            account_id=account.id,
+            trade_type=trade_type,
+            traded_on=traded_on,
+            quantity=quantity,
+            price=price,
+            cash_amount=cash_amount,
+            ratio=ratio,
+            fee=fee,
+            tax=tax,
+            currency=currency,
+            fx_rate_to_twd=fx_rate_to_twd,
+        )
+        db.session.add(trade)
+        db.session.commit()
+        return json_response(201, "交易建立成功", trade.to_dict())
+    except IntegrityError:
+        db.session.rollback()
+        return json_response(400, "資料格式不合法或違反約束條件")
+    except OperationalError:
+        db.session.rollback()
+        return json_response(500, "資料庫連線失敗，請稍後再試")
+    except Exception:
+        db.session.rollback()
+        return json_response(500, "伺服器內部錯誤")
+
+
+@trades_bp.route("/<int:trade_id>/void", methods=["POST"], strict_slashes=False)
+def void_trade(trade_id: int):
+    trade = db.session.get(Trade, trade_id)
+    if not trade:
+        return json_response(404, "找不到指定的交易")
+
+    if trade.income is not None:
+        return json_response(400, "此交易已有入帳記錄，不可作廢")
+
+    trade.voided_at = datetime.now(timezone.utc)
+    trade.updated_at = datetime.now(timezone.utc)
+
+    try:
+        db.session.commit()
+        return json_response(200, "交易作廢成功", trade.to_dict())
+    except OperationalError:
+        db.session.rollback()
+        return json_response(500, "資料庫連線失敗，請稍後再試")
+    except Exception:
+        db.session.rollback()
+        return json_response(500, "伺服器內部錯誤")
+
 

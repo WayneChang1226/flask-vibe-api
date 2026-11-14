@@ -1,0 +1,272 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+  <title>個人記帳本</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <!-- 驗收方式說明：在 ledger-api/ledger-web 用本機靜態伺服器開啟 -->
+  <div class="app-layout">
+    <!-- 頂端導覽列 -->
+    <header class="app-header">
+      <div class="header-content">
+        <h1 class="header-title">個人記帳本</h1>
+        <button id="btn-clear-connection" class="btn-text btn-danger" style="display: none;">清除連線</button>
+      </div>
+    </header>
+
+    <!-- 全域訊息提示橫幅 -->
+    <div id="global-alert" class="alert" style="display: none;">
+      <span id="alert-message"></span>
+    </div>
+
+    <!-- 主內容區 -->
+    <main class="main-content">
+      <!-- 畫面 0: 連線頁 -->
+      <section id="view-connection" class="view-panel active">
+        <div class="card connection-card">
+          <h2 class="card-title">後端 API 連線設定</h2>
+          <p class="card-desc">請輸入個人記帳本的後端伺服器網址進行連線驗證。</p>
+          <form id="form-connection" novalidate>
+            <div class="form-group">
+              <label for="input-api-url" class="form-label">後端服務網址</label>
+              <input
+                type="url"
+                id="input-api-url"
+                class="form-control"
+                placeholder="http://127.0.0.1:5000"
+                required
+                autocomplete="off"
+              >
+              <small class="form-hint">網址必須以 http:// 或 https:// 開頭。</small>
+            </div>
+            <button type="submit" id="btn-connect" class="btn btn-primary btn-block">連線並進入首頁</button>
+          </form>
+          <div class="static-server-note">
+            <p>※ 本畫面驗收方式：在 <code>ledger-api/ledger-web</code> 用本機靜態伺服器開啟。</p>
+          </div>
+        </div>
+      </section>
+
+      <!-- 畫面 1: 首頁 (收支看板與帳戶資產) -->
+      <section id="view-home" class="view-panel">
+        <!-- 月度生活現金流看板 -->
+        <div class="card summary-card">
+          <div class="summary-header">
+            <span class="summary-label">本月生活現金流</span>
+            <span id="home-month-display" class="summary-month">--</span>
+          </div>
+          <div class="summary-grid">
+            <div class="summary-item">
+              <span class="item-title">本月入帳</span>
+              <span id="home-income-twd" class="item-amount amount-income">0.00</span>
+            </div>
+            <div class="summary-item">
+              <span class="item-title">本月花費</span>
+              <span id="home-expense-twd" class="item-amount amount-expense">0.00</span>
+            </div>
+          </div>
+          <div class="summary-net">
+            <span class="net-title">本月結餘</span>
+            <span id="home-net-twd" class="net-amount">0.00</span>
+          </div>
+        </div>
+
+        <!-- 帳戶與餘額 -->
+        <div class="section-block">
+          <div class="section-header">
+            <h2 class="section-title">帳戶與餘額</h2>
+            <button id="btn-refresh-home" class="btn-text">重新整理</button>
+          </div>
+          <div id="home-accounts-list" class="accounts-grid">
+            <!-- 帳戶卡片將以 JS 動態渲染 -->
+          </div>
+          <!-- 無帳戶時之快速建立區塊 -->
+          <div id="home-empty-accounts" class="card empty-card" style="display: none;">
+            <p>目前尚未建立任何帳戶</p>
+            <button id="btn-create-cash-account" class="btn btn-secondary">快速建立現金帳戶</button>
+          </div>
+        </div>
+      </section>
+
+      <!-- 畫面 2: 記帳 (入帳 / 花費) -->
+      <section id="view-accounting" class="view-panel">
+        <!-- 類別切換標籤 -->
+        <div class="tab-switch">
+          <button id="btn-tab-expense" class="tab-btn active" type="button">花費 (支出)</button>
+          <button id="btn-tab-income" class="tab-btn" type="button">入帳 (收入)</button>
+        </div>
+
+        <!-- 花費表單 -->
+        <div id="panel-expense-form" class="card form-card">
+          <h2 class="card-title">新增花費</h2>
+          <form id="form-expense" novalidate>
+            <div class="form-group">
+              <label for="exp-spent-on" class="form-label">消費日期 <span class="required">*</span></label>
+              <input type="date" id="exp-spent-on" class="form-control" required>
+            </div>
+            <div class="form-group">
+              <label for="exp-amount" class="form-label">金額 (TWD) <span class="required">*</span></label>
+              <input type="number" id="exp-amount" class="form-control" step="0.01" min="0.01" placeholder="0.00" required>
+            </div>
+            <div class="form-group">
+              <label for="exp-category" class="form-label">花費分類 <span class="required">*</span></label>
+              <div class="input-with-action">
+                <select id="exp-category" class="form-control" required>
+                  <option value="">載入中...</option>
+                </select>
+                <button type="button" id="btn-quick-exp-cat" class="btn-icon" title="新增分類">+</button>
+              </div>
+            </div>
+            <div class="form-group">
+              <label for="exp-account" class="form-label">扣款帳戶 <span class="required">*</span></label>
+              <select id="exp-account" class="form-control" required>
+                <option value="">載入中...</option>
+              </select>
+            </div>
+            <div class="form-group">
+              <label for="exp-merchant" class="form-label">消費商家 (與備註至少填一項)</label>
+              <input type="text" id="exp-merchant" class="form-control" placeholder="如：全家便利商店">
+            </div>
+            <div class="form-group">
+              <label for="exp-note" class="form-label">備註 (與商家至少填一項)</label>
+              <input type="text" id="exp-note" class="form-control" placeholder="如：午餐便當">
+            </div>
+            <div class="form-group">
+              <label for="exp-settled-on" class="form-label">帳戶扣款日 (可選)</label>
+              <input type="date" id="exp-settled-on" class="form-control">
+            </div>
+            <button type="submit" class="btn btn-primary btn-block">儲存花費</button>
+          </form>
+        </div>
+
+        <!-- 入帳表單 -->
+        <div id="panel-income-form" class="card form-card" style="display: none;">
+          <h2 class="card-title">新增入帳</h2>
+          <form id="form-income" novalidate>
+            <div class="form-group">
+              <label for="inc-received-on" class="form-label">入帳日期 <span class="required">*</span></label>
+              <input type="date" id="inc-received-on" class="form-control" required>
+            </div>
+            <div class="form-group">
+              <label for="inc-amount" class="form-label">金額 (TWD) <span class="required">*</span></label>
+              <input type="number" id="inc-amount" class="form-control" step="0.01" min="0.01" placeholder="0.00" required>
+            </div>
+            <div class="form-group">
+              <label for="inc-category" class="form-label">入帳分類 <span class="required">*</span></label>
+              <div class="input-with-action">
+                <select id="inc-category" class="form-control" required>
+                  <option value="">載入中...</option>
+                </select>
+                <button type="button" id="btn-quick-inc-cat" class="btn-icon" title="新增分類">+</button>
+              </div>
+            </div>
+            <div class="form-group">
+              <label for="inc-account" class="form-label">存入帳戶 <span class="required">*</span></label>
+              <select id="inc-account" class="form-control" required>
+                <option value="">載入中...</option>
+              </select>
+            </div>
+            <div class="form-group">
+              <label for="inc-source" class="form-label">資金來源 (與備註至少填一項)</label>
+              <input type="text" id="inc-source" class="form-control" placeholder="如：十一月薪水">
+            </div>
+            <div class="form-group">
+              <label for="inc-note" class="form-label">備註 (與來源至少填一項)</label>
+              <input type="text" id="inc-note" class="form-control" placeholder="如：績效獎金">
+            </div>
+            <button type="submit" class="btn btn-primary btn-block">儲存入帳</button>
+          </form>
+        </div>
+
+        <!-- 本月明細清單 -->
+        <div class="section-block">
+          <h2 class="section-title">本月最新明細</h2>
+          <div id="accounting-recent-list" class="recent-list">
+            <!-- 記帳成功後將直接插入清單最上方 -->
+          </div>
+        </div>
+      </section>
+
+      <!-- 畫面 3: 投資 (台股標的、持有股數與最新報價) -->
+      <section id="view-investments" class="view-panel">
+        <div class="section-header">
+          <h2 class="section-title">台股投資標的</h2>
+          <button id="btn-fetch-quotes" class="btn btn-secondary btn-sm">抓取台股報價</button>
+        </div>
+        <div id="investments-feedback" class="feedback-msg" style="display: none;"></div>
+        <div id="investments-list" class="investments-grid">
+          <!-- 標的清單將以 JS 動態渲染 -->
+        </div>
+      </section>
+
+      <!-- 畫面 4: 發票 (發票清單唯讀) -->
+      <section id="view-invoices" class="view-panel">
+        <div class="section-header">
+          <h2 class="section-title">統一發票清單</h2>
+          <button id="btn-refresh-invoices" class="btn-text">重新整理</button>
+        </div>
+        <div id="invoices-list" class="invoices-grid">
+          <!-- 發票清單將以 JS 動態渲染 -->
+        </div>
+      </section>
+    </main>
+
+    <!-- 底部導覽列 -->
+    <nav id="bottom-nav" class="bottom-nav" style="display: none;">
+      <button class="nav-item active" data-view="view-home">
+        <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"></path>
+          <polyline points="9 22 9 12 15 12 15 22"></polyline>
+        </svg>
+        <span class="nav-text">首頁</span>
+      </button>
+      <button class="nav-item" data-view="view-accounting">
+        <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M12 20h9"></path>
+          <path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"></path>
+        </svg>
+        <span class="nav-text">記帳</span>
+      </button>
+      <button class="nav-item" data-view="view-investments">
+        <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <polyline points="23 6 13.5 15.5 8.5 10.5 1 18"></polyline>
+          <polyline points="17 6 23 6 23 12"></polyline>
+        </svg>
+        <span class="nav-text">投資</span>
+      </button>
+      <button class="nav-item" data-view="view-invoices">
+        <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path>
+          <polyline points="14 2 14 8 20 8"></polyline>
+          <line x1="16" y1="13" x2="8" y2="13"></line>
+          <line x1="16" y1="17" x2="8" y2="17"></line>
+          <polyline points="10 9 9 9 8 9"></polyline>
+        </svg>
+        <span class="nav-text">發票</span>
+      </button>
+    </nav>
+  </div>
+
+  <!-- 分類快速建立對話框 -->
+  <dialog id="modal-quick-category" class="modal-dialog">
+    <div class="modal-content">
+      <h3 id="modal-cat-title" class="modal-title">新增分類</h3>
+      <form id="form-quick-cat" novalidate>
+        <div class="form-group">
+          <label for="input-cat-name" class="form-label">分類名稱 <span class="required">*</span></label>
+          <input type="text" id="input-cat-name" class="form-control" placeholder="例如：餐飲飲食" required>
+        </div>
+        <div class="modal-actions">
+          <button type="button" id="btn-cancel-cat" class="btn btn-secondary">取消</button>
+          <button type="submit" class="btn btn-primary">建立</button>
+        </div>
+      </form>
+    </div>
+  </dialog>
+
+  <script src="app.js"></script>
+</body>
+</html>

@@ -1,8 +1,9 @@
 import os
+import re
 from datetime import datetime, timezone
 
 from dotenv import load_dotenv
-from flask import Flask
+from flask import Flask, Response, request
 from sqlalchemy import text
 from sqlalchemy.exc import OperationalError
 from werkzeug.exceptions import HTTPException
@@ -41,6 +42,57 @@ def create_app():
     app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 
     db.init_app(app)
+
+    def is_allowed_origin(origin: str | None) -> bool:
+        if not origin:
+            return False
+        web_origin = os.getenv("WEB_ORIGIN")
+        if web_origin and origin == web_origin.strip():
+            return True
+        if re.match(r"^http://127\.0\.0\.1(:\d+)?$", origin):
+            return True
+        if re.match(r"^http://localhost(:\d+)?$", origin):
+            return True
+        return False
+
+    @app.before_request
+    def handle_cors_preflight():
+        if request.method == "OPTIONS":
+            origin = request.headers.get("Origin")
+            if is_allowed_origin(origin):
+                response = Response(status=204)
+                response.headers["Access-Control-Allow-Origin"] = origin
+                response.headers["Access-Control-Allow-Methods"] = "GET, POST, PATCH, PUT, DELETE, OPTIONS"
+                req_headers = request.headers.get("Access-Control-Request-Headers")
+                if req_headers:
+                    response.headers["Access-Control-Allow-Headers"] = req_headers
+                else:
+                    response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
+                response.headers["Access-Control-Allow-Private-Network"] = "true"
+                response.headers["Access-Control-Max-Age"] = "86400"
+                response.headers["Vary"] = "Origin"
+                response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
+                return response
+
+    @app.after_request
+    def add_cors_headers(response):
+        origin = request.headers.get("Origin")
+        if is_allowed_origin(origin):
+            response.headers["Access-Control-Allow-Origin"] = origin
+            response.headers["Access-Control-Allow-Methods"] = "GET, POST, PATCH, PUT, DELETE, OPTIONS"
+            req_headers = request.headers.get("Access-Control-Request-Headers")
+            if req_headers:
+                response.headers["Access-Control-Allow-Headers"] = req_headers
+            response.headers["Access-Control-Allow-Private-Network"] = "true"
+
+        vary = response.headers.get("Vary")
+        if not vary:
+            response.headers["Vary"] = "Origin"
+        elif "Origin" not in [v.strip() for v in vary.split(",")]:
+            response.headers["Vary"] = f"{vary}, Origin"
+
+        response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
+        return response
 
     app.register_blueprint(accounts_bp)
     app.register_blueprint(transfers_bp)

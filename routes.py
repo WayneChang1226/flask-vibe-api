@@ -5,7 +5,15 @@ from flask import Blueprint, request
 from sqlalchemy.exc import IntegrityError, OperationalError
 
 from extensions import db
-from models import Account, Transfer, IncomeCategory, Income, Invoice
+from models import (
+    Account,
+    Transfer,
+    IncomeCategory,
+    Income,
+    Invoice,
+    ExpenseCategory,
+    Expense,
+)
 from utils import json_response
 
 ALLOWED_ACCOUNT_KINDS = {"cash", "bank", "credit_card", "broker"}
@@ -14,6 +22,8 @@ accounts_bp = Blueprint("accounts", __name__, url_prefix="/api/accounts")
 transfers_bp = Blueprint("transfers", __name__, url_prefix="/api/transfers")
 income_categories_bp = Blueprint("income_categories", __name__, url_prefix="/api/income-categories")
 incomes_bp = Blueprint("incomes", __name__, url_prefix="/api/incomes")
+expense_categories_bp = Blueprint("expense_categories", __name__, url_prefix="/api/expense-categories")
+expenses_bp = Blueprint("expenses", __name__, url_prefix="/api/expenses")
 
 
 # ==========================================
@@ -189,14 +199,16 @@ def get_account_balance(account_id: int):
     transfers_in = Transfer.query.filter_by(to_account_id=account.id).all()
     transfers_out = Transfer.query.filter_by(from_account_id=account.id).all()
     incomes = Income.query.filter_by(account_id=account.id).all()
+    expenses = Expense.query.filter_by(account_id=account.id).all()
 
-    # 原幣別餘額：期初餘額 + 轉入 - 轉出 + 入帳
+    # 原幣別餘額：期初餘額 + 轉入 - 轉出 + 入帳 - 花費
     orig_in = sum((Decimal(str(t.amount)) for t in transfers_in), Decimal("0"))
     orig_out = sum((Decimal(str(t.amount)) for t in transfers_out), Decimal("0"))
     orig_income = sum((Decimal(str(i.amount)) for i in incomes), Decimal("0"))
-    original_balance = opening + orig_in - orig_out + orig_income
+    orig_expense = sum((Decimal(str(e.amount)) for e in expenses), Decimal("0"))
+    original_balance = opening + orig_in - orig_out + orig_income - orig_expense
 
-    # 台幣餘額：轉入轉出與入帳金額先乘上該列的 fx_rate_to_twd
+    # 台幣餘額：轉入轉出、入帳與花費金額先乘上該列的 fx_rate_to_twd
     twd_in = sum(
         (Decimal(str(t.amount)) * Decimal(str(t.fx_rate_to_twd)) for t in transfers_in),
         Decimal("0"),
@@ -209,7 +221,11 @@ def get_account_balance(account_id: int):
         (Decimal(str(i.amount)) * Decimal(str(i.fx_rate_to_twd)) for i in incomes),
         Decimal("0"),
     )
-    twd_balance = opening + twd_in - twd_out + twd_income
+    twd_expense = sum(
+        (Decimal(str(e.amount)) * Decimal(str(e.fx_rate_to_twd)) for e in expenses),
+        Decimal("0"),
+    )
+    twd_balance = opening + twd_in - twd_out + twd_income - twd_expense
 
     data = {
         "account_id": account.id,
@@ -702,6 +718,418 @@ def update_income(income_id: int):
     try:
         db.session.commit()
         return json_response(200, "入帳記錄更新成功", income.to_dict())
+    except IntegrityError:
+        db.session.rollback()
+        return json_response(400, "資料格式不合法或違反約束條件")
+    except OperationalError:
+        db.session.rollback()
+        return json_response(500, "資料庫連線失敗，請稍後再試")
+    except Exception:
+        db.session.rollback()
+        return json_response(500, "伺服器內部錯誤")
+
+
+# ==========================================
+# 花費分類路由 Expense Categories Routes
+# ==========================================
+
+@expense_categories_bp.route("", methods=["GET"], strict_slashes=False)
+def list_expense_categories():
+    categories = ExpenseCategory.query.order_by(ExpenseCategory.id.asc()).all()
+    return json_response(200, "取得花費分類清單成功", [c.to_dict() for c in categories])
+
+
+@expense_categories_bp.route("", methods=["POST"], strict_slashes=False)
+def create_expense_category():
+    body = request.get_json(silent=True)
+    if body is None or not isinstance(body, dict):
+        return json_response(400, "請求內容必須是有效的 JSON 格式")
+
+    name_val = body.get("name")
+    if name_val is None or str(name_val).strip() == "":
+        return json_response(400, "分類名稱為必填項目")
+    name = str(name_val).strip()
+
+    existing = ExpenseCategory.query.filter_by(name=name).first()
+    if existing:
+        return json_response(400, "分類名稱已被使用，請使用其他名稱")
+
+    desc_val = body.get("description")
+    description = str(desc_val).strip() if desc_val is not None and str(desc_val).strip() != "" else None
+
+    try:
+        category = ExpenseCategory(name=name, description=description)
+        db.session.add(category)
+        db.session.commit()
+        return json_response(201, "花費分類建立成功", category.to_dict())
+    except IntegrityError:
+        db.session.rollback()
+        return json_response(400, "資料格式不合法或違反約束條件")
+    except OperationalError:
+        db.session.rollback()
+        return json_response(500, "資料庫連線失敗，請稍後再試")
+    except Exception:
+        db.session.rollback()
+        return json_response(500, "伺服器內部錯誤")
+
+
+@expense_categories_bp.route("/<int:category_id>", methods=["GET"], strict_slashes=False)
+def get_expense_category(category_id: int):
+    category = db.session.get(ExpenseCategory, category_id)
+    if not category:
+        return json_response(404, "找不到指定的花費分類")
+    return json_response(200, "取得花費分類成功", category.to_dict())
+
+
+@expense_categories_bp.route("/<int:category_id>", methods=["PATCH"], strict_slashes=False)
+def update_expense_category(category_id: int):
+    category = db.session.get(ExpenseCategory, category_id)
+    if not category:
+        return json_response(404, "找不到指定的花費分類")
+
+    body = request.get_json(silent=True)
+    if body is None or not isinstance(body, dict):
+        return json_response(400, "請求內容必須是有效的 JSON 格式")
+
+    if "name" in body:
+        name_val = body.get("name")
+        if name_val is None or str(name_val).strip() == "":
+            return json_response(400, "分類名稱不能為空")
+        new_name = str(name_val).strip()
+        existing = ExpenseCategory.query.filter(
+            ExpenseCategory.name == new_name,
+            ExpenseCategory.id != category_id,
+        ).first()
+        if existing:
+            return json_response(400, "分類名稱已被使用，請使用其他名稱")
+        category.name = new_name
+
+    if "description" in body:
+        desc_val = body.get("description")
+        category.description = str(desc_val).strip() if desc_val is not None and str(desc_val).strip() != "" else None
+
+    category.updated_at = datetime.now(timezone.utc)
+
+    try:
+        db.session.commit()
+        return json_response(200, "花費分類更新成功", category.to_dict())
+    except IntegrityError:
+        db.session.rollback()
+        return json_response(400, "資料格式不合法或違反約束條件")
+    except OperationalError:
+        db.session.rollback()
+        return json_response(500, "資料庫連線失敗，請稍後再試")
+    except Exception:
+        db.session.rollback()
+        return json_response(500, "伺服器內部錯誤")
+
+
+# ==========================================
+# 花費路由 Expenses Routes
+# ==========================================
+
+@expenses_bp.route("", methods=["GET"], strict_slashes=False)
+def list_expenses():
+    query = Expense.query
+
+    if "account_id" in request.args:
+        try:
+            acc_id = int(request.args.get("account_id"))
+            query = query.filter(Expense.account_id == acc_id)
+        except (TypeError, ValueError):
+            return json_response(400, "帳戶 ID 必須為整數")
+
+    if "category_id" in request.args:
+        try:
+            cat_id = int(request.args.get("category_id"))
+            query = query.filter(Expense.category_id == cat_id)
+        except (TypeError, ValueError):
+            return json_response(400, "分類 ID 必須為整數")
+
+    if "invoice_id" in request.args:
+        try:
+            inv_id = int(request.args.get("invoice_id"))
+            query = query.filter(Expense.invoice_id == inv_id)
+        except (TypeError, ValueError):
+            return json_response(400, "發票 ID 必須為整數")
+
+    if "date_from" in request.args:
+        date_from_val = request.args.get("date_from", "").strip()
+        if date_from_val != "":
+            try:
+                d_from = datetime.strptime(date_from_val, "%Y-%m-%d").date()
+                query = query.filter(Expense.spent_on >= d_from)
+            except ValueError:
+                return json_response(400, "起始日期格式不正確，請使用 YYYY-MM-DD 格式")
+
+    if "date_to" in request.args:
+        date_to_val = request.args.get("date_to", "").strip()
+        if date_to_val != "":
+            try:
+                d_to = datetime.strptime(date_to_val, "%Y-%m-%d").date()
+                query = query.filter(Expense.spent_on <= d_to)
+            except ValueError:
+                return json_response(400, "結束日期格式不正確，請使用 YYYY-MM-DD 格式")
+
+    expenses = query.order_by(Expense.spent_on.desc(), Expense.id.desc()).all()
+    return json_response(200, "取得花費清單成功", [e.to_dict() for e in expenses])
+
+
+@expenses_bp.route("", methods=["POST"], strict_slashes=False)
+def create_expense():
+    body = request.get_json(silent=True)
+    if body is None or not isinstance(body, dict):
+        return json_response(400, "請求內容必須是有效的 JSON 格式")
+
+    spent_on_val = body.get("spent_on")
+    if spent_on_val is None or str(spent_on_val).strip() == "":
+        return json_response(400, "消費日期為必填項目")
+    try:
+        spent_on = datetime.strptime(str(spent_on_val).strip(), "%Y-%m-%d").date()
+    except ValueError:
+        return json_response(400, "消費日期格式不正確，請使用 YYYY-MM-DD 格式")
+
+    settled_on = None
+    if "settled_on" in body and body["settled_on"] is not None and str(body["settled_on"]).strip() != "":
+        try:
+            settled_on = datetime.strptime(str(body["settled_on"]).strip(), "%Y-%m-%d").date()
+        except ValueError:
+            return json_response(400, "扣款日期格式不正確，請使用 YYYY-MM-DD 格式")
+
+    amount_val = body.get("amount")
+    if amount_val is None:
+        return json_response(400, "花費金額為必填項目")
+    try:
+        amount = Decimal(str(amount_val))
+        if amount <= 0:
+            return json_response(400, "金額必須大於 0")
+    except (InvalidOperation, TypeError, ValueError):
+        return json_response(400, "金額格式不正確，必須為正數")
+
+    currency_val = body.get("currency")
+    if currency_val is None or str(currency_val).strip() == "":
+        return json_response(400, "幣別為必填項目")
+    currency = str(currency_val).strip().upper()
+    if len(currency) != 3 or not currency.isalpha():
+        return json_response(400, "幣別代碼必須為 3 碼英文字母")
+
+    fx_rate_val = body.get("fx_rate_to_twd")
+    if fx_rate_val is None:
+        return json_response(400, "匯率為必填項目")
+    try:
+        fx_rate_to_twd = Decimal(str(fx_rate_val))
+        if fx_rate_to_twd <= 0:
+            return json_response(400, "匯率必須大於 0")
+    except (InvalidOperation, TypeError, ValueError):
+        return json_response(400, "匯率格式不正確，必須為正數")
+
+    cat_id_val = body.get("category_id")
+    if cat_id_val is None:
+        return json_response(400, "花費分類為必填項目")
+    try:
+        category_id = int(cat_id_val)
+    except (TypeError, ValueError):
+        return json_response(400, "分類 ID 必須為整數")
+
+    category = db.session.get(ExpenseCategory, category_id)
+    if not category:
+        return json_response(400, "指定的花費分類不存在")
+
+    acc_id_val = body.get("account_id")
+    if acc_id_val is None:
+        return json_response(400, "帳戶為必填項目")
+    try:
+        account_id = int(acc_id_val)
+    except (TypeError, ValueError):
+        return json_response(400, "帳戶 ID 必須為整數")
+
+    account = db.session.get(Account, account_id)
+    if not account:
+        return json_response(400, "指定的帳戶不存在")
+
+    merchant_val = body.get("merchant")
+    merchant = str(merchant_val).strip() if merchant_val is not None and str(merchant_val).strip() != "" else None
+
+    note_val = body.get("note")
+    note = str(note_val).strip() if note_val is not None and str(note_val).strip() != "" else None
+
+    if merchant is None and note is None:
+        return json_response(400, "商家與備註不可同時為空，至少需填寫一項")
+
+    invoice_id = None
+    if "invoice_id" in body and body["invoice_id"] is not None:
+        try:
+            invoice_id = int(body["invoice_id"])
+        except (TypeError, ValueError):
+            return json_response(400, "發票 ID 必須為整數")
+
+        invoice = db.session.get(Invoice, invoice_id)
+        if not invoice:
+            return json_response(400, "指定的發票不存在")
+
+    try:
+        expense = Expense(
+            spent_on=spent_on,
+            settled_on=settled_on,
+            amount=amount,
+            currency=currency,
+            fx_rate_to_twd=fx_rate_to_twd,
+            category_id=category_id,
+            account_id=account_id,
+            merchant=merchant,
+            note=note,
+            invoice_id=invoice_id,
+        )
+        db.session.add(expense)
+        db.session.commit()
+        return json_response(201, "花費建立成功", expense.to_dict())
+    except IntegrityError:
+        db.session.rollback()
+        return json_response(400, "資料格式不合法或違反約束條件")
+    except OperationalError:
+        db.session.rollback()
+        return json_response(500, "資料庫連線失敗，請稍後再試")
+    except Exception:
+        db.session.rollback()
+        return json_response(500, "伺服器內部錯誤")
+
+
+@expenses_bp.route("/<int:expense_id>", methods=["GET"], strict_slashes=False)
+def get_expense(expense_id: int):
+    expense = db.session.get(Expense, expense_id)
+    if not expense:
+        return json_response(404, "找不到指定的花費記錄")
+    return json_response(200, "取得花費記錄成功", expense.to_dict())
+
+
+@expenses_bp.route("/<int:expense_id>", methods=["PATCH"], strict_slashes=False)
+def update_expense(expense_id: int):
+    expense = db.session.get(Expense, expense_id)
+    if not expense:
+        return json_response(404, "找不到指定的花費記錄")
+
+    body = request.get_json(silent=True)
+    if body is None or not isinstance(body, dict):
+        return json_response(400, "請求內容必須是有效的 JSON 格式")
+
+    if "spent_on" in body:
+        val = body.get("spent_on")
+        if val is None or str(val).strip() == "":
+            return json_response(400, "消費日期不能為空")
+        try:
+            expense.spent_on = datetime.strptime(str(val).strip(), "%Y-%m-%d").date()
+        except ValueError:
+            return json_response(400, "消費日期格式不正確，請使用 YYYY-MM-DD 格式")
+
+    if "settled_on" in body:
+        val = body.get("settled_on")
+        if val is None or str(val).strip() == "":
+            expense.settled_on = None
+        else:
+            try:
+                expense.settled_on = datetime.strptime(str(val).strip(), "%Y-%m-%d").date()
+            except ValueError:
+                return json_response(400, "扣款日期格式不正確，請使用 YYYY-MM-DD 格式")
+
+    if "amount" in body:
+        val = body.get("amount")
+        if val is None:
+            return json_response(400, "金額不能為空")
+        try:
+            amt = Decimal(str(val))
+            if amt <= 0:
+                return json_response(400, "金額必須大於 0")
+            expense.amount = amt
+        except (InvalidOperation, TypeError, ValueError):
+            return json_response(400, "金額格式不正確，必須為正數")
+
+    if "currency" in body:
+        val = body.get("currency")
+        if val is None or str(val).strip() == "":
+            return json_response(400, "幣別不能為空")
+        cur = str(val).strip().upper()
+        if len(cur) != 3 or not cur.isalpha():
+            return json_response(400, "幣別代碼必須為 3 碼英文字母")
+        expense.currency = cur
+
+    if "fx_rate_to_twd" in body:
+        val = body.get("fx_rate_to_twd")
+        if val is None:
+            return json_response(400, "匯率不能為空")
+        try:
+            fx = Decimal(str(val))
+            if fx <= 0:
+                return json_response(400, "匯率必須大於 0")
+            expense.fx_rate_to_twd = fx
+        except (InvalidOperation, TypeError, ValueError):
+            return json_response(400, "匯率格式不正確，必須為正數")
+
+    if "category_id" in body:
+        val = body.get("category_id")
+        if val is None:
+            return json_response(400, "分類不能為空")
+        try:
+            cat_id = int(val)
+        except (TypeError, ValueError):
+            return json_response(400, "分類 ID 必須為整數")
+        cat = db.session.get(ExpenseCategory, cat_id)
+        if not cat:
+            return json_response(400, "指定的花費分類不存在")
+        expense.category_id = cat_id
+
+    if "account_id" in body:
+        val = body.get("account_id")
+        if val is None:
+            return json_response(400, "帳戶不能為空")
+        try:
+            acc_id = int(val)
+        except (TypeError, ValueError):
+            return json_response(400, "帳戶 ID 必須為整數")
+        acc = db.session.get(Account, acc_id)
+        if not acc:
+            return json_response(400, "指定的帳戶不存在")
+        expense.account_id = acc_id
+
+    if "invoice_id" in body:
+        val = body.get("invoice_id")
+        if val is None or str(val).strip() == "":
+            expense.invoice_id = None
+        else:
+            try:
+                inv_id = int(val)
+            except (TypeError, ValueError):
+                return json_response(400, "發票 ID 必須為整數")
+            inv = db.session.get(Invoice, inv_id)
+            if not inv:
+                return json_response(400, "指定的發票不存在")
+            expense.invoice_id = inv_id
+
+    # 處理 merchant 與 note，兩者不可同時為空
+    if "merchant" in body or "note" in body:
+        if "merchant" in body:
+            m_val = body.get("merchant")
+            new_merchant = str(m_val).strip() if m_val is not None and str(m_val).strip() != "" else None
+        else:
+            new_merchant = expense.merchant
+
+        if "note" in body:
+            n_val = body.get("note")
+            new_note = str(n_val).strip() if n_val is not None and str(n_val).strip() != "" else None
+        else:
+            new_note = expense.note
+
+        if new_merchant is None and new_note is None:
+            return json_response(400, "商家與備註不可同時為空，至少需填寫一項")
+
+        expense.merchant = new_merchant
+        expense.note = new_note
+
+    # 改 updated_at
+    expense.updated_at = datetime.now(timezone.utc)
+
+    try:
+        db.session.commit()
+        return json_response(200, "花費記錄更新成功", expense.to_dict())
     except IntegrityError:
         db.session.rollback()
         return json_response(400, "資料格式不合法或違反約束條件")

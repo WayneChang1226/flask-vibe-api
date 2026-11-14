@@ -8,7 +8,14 @@ from sqlalchemy.exc import OperationalError
 from werkzeug.exceptions import HTTPException
 
 from extensions import db
-from routes import accounts_bp, transfers_bp, income_categories_bp, incomes_bp
+from routes import (
+    accounts_bp,
+    transfers_bp,
+    income_categories_bp,
+    incomes_bp,
+    expense_categories_bp,
+    expenses_bp,
+)
 from utils import json_response
 
 
@@ -34,6 +41,8 @@ def create_app():
     app.register_blueprint(transfers_bp)
     app.register_blueprint(income_categories_bp)
     app.register_blueprint(incomes_bp)
+    app.register_blueprint(expense_categories_bp)
+    app.register_blueprint(expenses_bp)
 
     @app.errorhandler(HTTPException)
     def handle_http_exception(error):

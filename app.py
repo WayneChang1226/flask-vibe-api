@@ -2,21 +2,14 @@ import os
 from datetime import datetime, timezone
 
 from dotenv import load_dotenv
-from flask import Flask, jsonify
+from flask import Flask
 from sqlalchemy import text
+from sqlalchemy.exc import OperationalError
 from werkzeug.exceptions import HTTPException
 
 from extensions import db
-
-
-def json_response(code: int, message: str, data=None):
-    return jsonify(
-        {
-            "code": code,
-            "message": message,
-            "data": data,
-        }
-    ), code
+from routes import accounts_bp, transfers_bp
+from utils import json_response
 
 
 def create_app():
@@ -37,11 +30,19 @@ def create_app():
 
     db.init_app(app)
 
+    app.register_blueprint(accounts_bp)
+    app.register_blueprint(transfers_bp)
+
     @app.errorhandler(HTTPException)
     def handle_http_exception(error):
         if error.code == 404:
-            return json_response(404, "找不到這一筆", None)
+            return json_response(404, "找不到指定的資源", None)
         return json_response(error.code, error.description, None)
+
+    @app.errorhandler(OperationalError)
+    def handle_operational_error(error):
+        app.logger.error("資料庫連線錯誤: %s", error, exc_info=True)
+        return json_response(500, "資料庫暫時連不上", None)
 
     @app.get("/api/health")
     def health_check():

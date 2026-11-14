@@ -533,3 +533,139 @@ class Income(db.Model):
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,
         }
+
+
+class ExpenseCategory(db.Model):
+    __tablename__ = "expense_categories"
+
+    id = db.Column(db.BigInteger, db.Identity(always=True), primary_key=True)
+    name = db.Column(db.String(50), nullable=False, unique=True)
+    description = db.Column(db.Text, nullable=True)
+    created_at = db.Column(
+        db.DateTime(timezone=True),
+        nullable=False,
+        server_default=db.text("(now() AT TIME ZONE 'utc')"),
+    )
+    updated_at = db.Column(
+        db.DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+        server_default=db.text("(now() AT TIME ZONE 'utc')"),
+    )
+
+    expenses = db.relationship(
+        "Expense",
+        backref=db.backref("category", lazy="select"),
+        lazy="select",
+    )
+
+    def __repr__(self):
+        return f"<ExpenseCategory id={self.id} name={self.name!r}>"
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "name": self.name,
+            "description": self.description,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+        }
+
+
+class Expense(db.Model):
+    __tablename__ = "expenses"
+
+    id = db.Column(db.BigInteger, db.Identity(always=True), primary_key=True)
+    spent_on = db.Column(db.Date, nullable=False)
+    settled_on = db.Column(db.Date, nullable=True)
+    amount = db.Column(db.Numeric(16, 4), nullable=False)
+    currency = db.Column(db.String(3), nullable=False, default="TWD", server_default="TWD")
+    fx_rate_to_twd = db.Column(
+        db.Numeric(12, 6),
+        nullable=False,
+        default=1.0,
+        server_default="1.0",
+    )
+    category_id = db.Column(
+        db.BigInteger,
+        db.ForeignKey("expense_categories.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    account_id = db.Column(
+        db.BigInteger,
+        db.ForeignKey("accounts.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    merchant = db.Column(db.String(100), nullable=True)
+    note = db.Column(db.Text, nullable=True)
+    invoice_id = db.Column(
+        db.BigInteger,
+        db.ForeignKey("invoices.id", ondelete="RESTRICT"),
+        nullable=True,
+    )
+    created_at = db.Column(
+        db.DateTime(timezone=True),
+        nullable=False,
+        server_default=db.text("(now() AT TIME ZONE 'utc')"),
+    )
+    updated_at = db.Column(
+        db.DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+        server_default=db.text("(now() AT TIME ZONE 'utc')"),
+    )
+
+    account = db.relationship(
+        "Account",
+        backref=db.backref("expenses", lazy="select"),
+        lazy="select",
+    )
+    invoice = db.relationship(
+        "Invoice",
+        backref=db.backref("expenses", lazy="select", passive_deletes=True),
+        lazy="select",
+    )
+
+    __table_args__ = (
+        db.CheckConstraint(
+            "amount > 0",
+            name="ck_expenses_amount_positive",
+        ),
+        db.CheckConstraint(
+            "currency ~ '^[A-Z]{3}$'",
+            name="ck_expenses_currency",
+        ),
+        db.CheckConstraint(
+            "fx_rate_to_twd > 0",
+            name="ck_expenses_fx_rate_to_twd_positive",
+        ),
+        db.CheckConstraint(
+            "merchant IS NOT NULL OR note IS NOT NULL",
+            name="ck_expenses_merchant_or_note_not_null",
+        ),
+    )
+
+    def __repr__(self):
+        return (
+            f"<Expense id={self.id} on={self.spent_on} amount={self.amount} "
+            f"account_id={self.account_id} category_id={self.category_id}>"
+        )
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "spent_on": self.spent_on.isoformat() if self.spent_on else None,
+            "settled_on": self.settled_on.isoformat() if self.settled_on else None,
+            "amount": float(self.amount) if self.amount is not None else 0.0,
+            "currency": self.currency,
+            "fx_rate_to_twd": float(self.fx_rate_to_twd) if self.fx_rate_to_twd is not None else 1.0,
+            "category_id": self.category_id,
+            "account_id": self.account_id,
+            "merchant": self.merchant,
+            "note": self.note,
+            "invoice_id": self.invoice_id,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+        }

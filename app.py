@@ -46,8 +46,12 @@ def create_app():
     def is_allowed_origin(origin: str | None) -> bool:
         if not origin:
             return False
-        web_origin = os.getenv("WEB_ORIGIN")
-        if web_origin and origin == web_origin.strip():
+        web_origins = os.getenv("WEB_ORIGIN", "")
+        if origin in (
+            allowed_origin.strip().rstrip("/")
+            for allowed_origin in web_origins.split(",")
+            if allowed_origin.strip()
+        ):
             return True
         if re.match(r"^http://127\.0\.0\.1(:\d+)?$", origin):
             return True
